@@ -14,7 +14,7 @@ function Invoke-HypocriticalSaintSetup {
         Write-Host "                   Digital Image Steganography Studio" -ForegroundColor White
         Write-Host "             'Innocent on the Outside. Secret on the Inside.'" -ForegroundColor Gray
         Write-Host "==============================================================================" -ForegroundColor DarkRed
-        Write-Host "  Author:     Um Al-Baneen Awwad (أم البنين عواد)" -ForegroundColor DarkGray
+        Write-Host "  Author:     Um Al-Baneen Awwad" -ForegroundColor DarkGray
         Write-Host "  Course:     Digital Image Processing (4th Year Computer Engineering)" -ForegroundColor DarkGray
         Write-Host "  University: University of Basrah" -ForegroundColor DarkGray
         Write-Host "==============================================================================" -ForegroundColor DarkRed
@@ -52,51 +52,57 @@ function Invoke-HypocriticalSaintSetup {
 
         # 2. Python Detection (Search for Python 3.10 - 3.12)
         Write-Host "[2/7] Detecting Compatible Python Engine..." -ForegroundColor Cyan
-        $PythonCmd = $null
+        $PythonExe = ""
+        $PythonExtraArg = ""
         $PythonVersionStr = ""
 
-        $CandidateCmds = @(
-            @("py", "-3.12"),
-            @("py", "-3.11"),
-            @("py", "-3.10"),
-            @("py", "-3"),
-            @("python"),
-            @("$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"),
-            @("$env:LOCALAPPDATA\Programs\Python\Python311\python.exe"),
-            @("$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"),
-            @("C:\Python312\python.exe"),
-            @("C:\Python311\python.exe"),
-            @("C:\Python310\python.exe")
-        )
-
-        foreach ($Candidate in $CandidateCmds) {
+        function Test-Py([string]$Cmd, [string]$ExtraArg) {
             try {
-                $CandidateExe = $Candidate[0]
-                $CandidateArgs = if ($Candidate.Length -gt 1) { $Candidate[1..($Candidate.Length - 1)] } else { @() }
-
-                if ($CandidateExe -like "*\*" -and -not (Test-Path $CandidateExe)) {
-                    continue
+                if ($Cmd -like "*\*" -and -not (Test-Path $Cmd)) { return $null }
+                $output = if ($ExtraArg) {
+                    & $Cmd $ExtraArg -c "import sys; print(sys.version.split()[0])" 2>$null
+                } else {
+                    & $Cmd -c "import sys; print(sys.version.split()[0])" 2>$null
                 }
-
-                $TestArgs = $CandidateArgs + @("-c", "import sys; print(sys.version.split()[0])")
-                $Output = & $CandidateExe @TestArgs 2>$null
-                if ($LASTEXITCODE -eq 0 -and $Output) {
-                    $vParts = $Output.Trim().Split(".")
-                    $vMajor = [int]$vParts[0]
-                    $vMinor = [int]$vParts[1]
-                    if ($vMajor -eq 3 -and $vMinor -ge 10) {
-                        $PythonCmd = $Candidate
-                        $PythonVersionStr = $Output.Trim()
-                        break
+                if ($LASTEXITCODE -eq 0 -and $output) {
+                    $v = $output.Trim().Split(".")
+                    if ([int]$v[0] -eq 3 -and [int]$v[1] -ge 10) {
+                        return $output.Trim()
                     }
                 }
             } catch {}
+            return $null
         }
 
-        if (-not $PythonCmd) {
+        $Candidates = @(
+            @{ Exe = "py"; Arg = "-3.12" },
+            @{ Exe = "py"; Arg = "-3.11" },
+            @{ Exe = "py"; Arg = "-3.10" },
+            @{ Exe = "py"; Arg = "-3" },
+            @{ Exe = "python"; Arg = "" },
+            @{ Exe = "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"; Arg = "" },
+            @{ Exe = "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe"; Arg = "" },
+            @{ Exe = "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"; Arg = "" },
+            @{ Exe = "C:\Python312\python.exe"; Arg = "" },
+            @{ Exe = "C:\Python311\python.exe"; Arg = "" },
+            @{ Exe = "C:\Python310\python.exe"; Arg = "" }
+        )
+
+        foreach ($c in $Candidates) {
+            $ver = Test-Py $c.Exe $c.Arg
+            if ($ver) {
+                $PythonExe = $c.Exe
+                $PythonExtraArg = $c.Arg
+                $PythonVersionStr = $ver
+                break
+            }
+        }
+
+        if (-not $PythonExe) {
             throw "No compatible Python installation found. Python 3.10, 3.11, or 3.12 is required."
         }
-        Write-Host "      [OK] Python $PythonVersionStr found ($($PythonCmd -join ' '))." -ForegroundColor Green
+        $DisplayCmd = if ($PythonExtraArg) { "$PythonExe $PythonExtraArg" } else { $PythonExe }
+        Write-Host "      [OK] Python $PythonVersionStr found ($DisplayCmd)." -ForegroundColor Green
 
         # 3. Target Installation Directory Determination
         Write-Host "[3/7] Determining Installation Directory..." -ForegroundColor Cyan
@@ -196,11 +202,11 @@ function Invoke-HypocriticalSaintSetup {
 
         if (-not (Test-Path $VenvPython)) {
             Write-Host "      [*] Creating virtual environment in $VenvPath..." -ForegroundColor Cyan
-            $Exe = $PythonCmd[0]
-            $Args = if ($PythonCmd.Length -gt 1) { $PythonCmd[1..($PythonCmd.Length - 1)] } else { @() }
-            $VenvArgs = $Args + @("-m", "venv", $VenvPath)
-            
-            & $Exe @VenvArgs
+            if ($PythonExtraArg) {
+                & $PythonExe $PythonExtraArg -m venv $VenvPath
+            } else {
+                & $PythonExe -m venv $VenvPath
+            }
             if (-not (Test-Path $VenvPython)) {
                 throw "Failed to create virtual environment at $VenvPath."
             }
@@ -227,13 +233,11 @@ function Invoke-HypocriticalSaintSetup {
         # 7. Global CLI Command Configuration (PROJECT RUN)
         Write-Host "[7/7] Registering Global 'PROJECT RUN' Command..." -ForegroundColor Cyan
         
-        # Store project directory in persistent user registry
         try {
             Set-ItemProperty -Path "HKCU:\Environment" -Name "HYPOCRITICAL_SAINT_HOME" -Value $InstallDir -Force
         } catch {}
         $env:HYPOCRITICAL_SAINT_HOME = $InstallDir
 
-        # Add InstallDir to User PATH persistently
         $UserPath = (Get-ItemProperty -Path "HKCU:\Environment" -Name "Path" -ErrorAction SilentlyContinue).Path
         $PathEntries = if ($UserPath) { $UserPath -split ";" } else { @() }
         if ($PathEntries -notcontains $InstallDir) {
@@ -245,7 +249,6 @@ function Invoke-HypocriticalSaintSetup {
             Write-Host "      [OK] Added '$InstallDir' to persistent User PATH." -ForegroundColor Green
         }
 
-        # Place PROJECT.cmd in WindowsApps directory for instant session availability
         $WindowsAppsDir = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
         if (Test-Path $WindowsAppsDir) {
             $SourceCmd = Join-Path $InstallDir "PROJECT.cmd"
@@ -273,7 +276,6 @@ function Invoke-HypocriticalSaintSetup {
         Write-Host "==============================================================================" -ForegroundColor Green
         Write-Host ""
 
-        # Launch application unless -NoLaunch is specified
         if (-not $NoLaunch) {
             $IsPortRunning = $false
             try {
