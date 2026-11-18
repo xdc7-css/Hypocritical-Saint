@@ -218,20 +218,7 @@ function Invoke-HypocriticalSaintSetup {
 
         # 6. Automated Functional Verification
         Write-Host "[6/7] Running Verification and Diagnostic Checks..." -ForegroundColor Cyan
-        $VerifyScript = @"
-import sys
-try:
-    import stegano
-    import gradio
-    import PIL
-    import cv2
-    import numpy
-    print('ALL_MODULES_OK')
-except Exception as e:
-    print(f'IMPORT_ERROR: {e}')
-    sys.exit(1)
-"@
-        $VerifyOutput = & $VenvPython -c $VerifyScript 2>&1
+        $VerifyOutput = & $VenvPython -c "import sys, stegano, gradio, PIL, cv2, numpy; print('ALL_MODULES_OK')" 2>&1
         if ($VerifyOutput -notmatch "ALL_MODULES_OK") {
             throw "Module verification failed: $VerifyOutput"
         }
