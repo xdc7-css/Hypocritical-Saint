@@ -1,0 +1,7 @@
+# HYPOCRITICAL SAINT - Dependencies
+pillow>=10.0.0
+piexif>=1.1.3
+crayons>=0.4.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+gradio>=6.0.0
