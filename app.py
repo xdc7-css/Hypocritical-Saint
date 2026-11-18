@@ -19,6 +19,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Optional, Tuple
 
+import cv2
 import gradio as gr
 import numpy as np
 from PIL import Image
@@ -98,8 +99,14 @@ TRANSLATIONS = {
         "btn_forward_reveal": "الانتقال لاستخراج الرسالة ←",
         "btn_hide_another": "إخفاء رسالة جديدة",
         "slider_title": "مقارنة الصورة الأصلية مع الصورة المعدّلة",
-        "diff_map_label": "خريطة الاختلافات (اللون العنابي = البكسلات المعدّلة)",
+        "diff_map_label": "خريطة الاختلافات (توهج وإطار تحديد البكسلات المعدّلة)",
         "tech_metrics_title": "التحليل العلمي وتفاصيل جودة الصورة",
+        "zoom_panel_title": "تكبير منطقة التغيّر",
+        "zoom_panel_sub": "المربع يحدد مكان البكسلات المتغيرة",
+        "zoom_orig_label": "الصورة الأصلية (مكبرة)",
+        "zoom_mod_label": "الصورة المعدّلة (مكبرة)",
+        "zoom_diff_label": "خريطة الفروق (مكبرة)",
+        "select_region_label": "تحديد منطقة التغيّر للمعاينة المجهرية",
         
         # Reveal Message Tab
         "stego_upload_title": "الصورة المخفية",
@@ -130,7 +137,7 @@ TRANSLATIONS = {
         "cmp_orig_label": "الصورة الأصلية",
         "cmp_mod_label": "الصورة المعدّلة",
         "btn_compare": "حساب الفروق وجودة الصورة",
-        "cmp_diff_label": "خريطة الاختلافات (اللون العنابي = البكسلات المعدّلة)",
+        "cmp_diff_label": "خريطة الاختلافات (توهج وإطار تحديد البكسلات المعدّلة)",
         
         # Bit analysis tool
         "bit_input_label": "الصورة المراد فحصها",
@@ -203,8 +210,14 @@ TRANSLATIONS = {
         "btn_forward_reveal": "Forward to Reveal Message →",
         "btn_hide_another": "Conceal Another Message",
         "slider_title": "Original vs. Modified Image Comparison",
-        "diff_map_label": "Difference Map (Maroon = Changed Pixels)",
+        "diff_map_label": "Difference Map (Glow & Highlight Box on Changed Pixels)",
         "tech_metrics_title": "Detailed Image Quality & Technical Metrics",
+        "zoom_panel_title": "Zoomed Change Region",
+        "zoom_panel_sub": "Box marks the changed pixels",
+        "zoom_orig_label": "Original Image (Zoomed)",
+        "zoom_mod_label": "Modified Image (Zoomed)",
+        "zoom_diff_label": "Difference Map (Zoomed)",
+        "select_region_label": "Select Change Region to Inspect",
         
         # Reveal Message Tab
         "stego_upload_title": "Hidden-Message Image",
@@ -235,7 +248,7 @@ TRANSLATIONS = {
         "cmp_orig_label": "Original Image",
         "cmp_mod_label": "Modified Image",
         "btn_compare": "Calculate Quality & Differences",
-        "cmp_diff_label": "Difference Map (Maroon = Changed Pixels)",
+        "cmp_diff_label": "Difference Map (Glow & Highlight Box on Changed Pixels)",
         
         # Bit analysis tool
         "bit_input_label": "Image to Inspect",
@@ -383,6 +396,322 @@ def generate_comparison_slider_html(cover_img: Image.Image, stego_img: Image.Ima
     """
 
 
+def detect_change_clusters(diff_mask: np.ndarray, max_clusters: int = 6) -> list:
+    """
+    Detect spatial clusters of modified pixels and return their bounding boxes.
+    Returns list of dicts: [{'id': 1, 'x': x, 'y': y, 'w': w, 'h': h, 'pixel_count': n, 'center': (cx, cy)}, ...]
+    """
+    if not np.any(diff_mask):
+        return []
+    
+    H, W = diff_mask.shape
+    # Dilation kernel to bridge nearby modified pixels into cohesive clusters
+    bridge_k = max(7, int(min(H, W) * 0.02) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (bridge_k, bridge_k))
+    dilated = cv2.dilate(diff_mask.astype(np.uint8), kernel, iterations=1)
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    clusters = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        sub_mask = diff_mask[y:y+h, x:x+w]
+        count = int(np.sum(sub_mask))
+        if count > 0:
+            clusters.append({
+                "x": int(x),
+                "y": int(y),
+                "w": int(w),
+                "h": int(h),
+                "pixel_count": count,
+                "center": (int(x + w // 2), int(y + h // 2))
+            })
+            
+    # Sort clusters by pixel count in descending order
+    clusters.sort(key=lambda c: c["pixel_count"], reverse=True)
+    for i, c in enumerate(clusters[:max_clusters]):
+        c["id"] = i + 1
+        
+    return clusters[:max_clusters]
+
+
+def draw_bounding_boxes(
+    canvas_rgb: np.ndarray,
+    clusters: list,
+    box_color: tuple = (255, 215, 65),  # Vivid Amber Gold
+    thickness: int = 2
+) -> np.ndarray:
+    """Draw high-contrast multi-stroke bounding boxes and corner reticles around change clusters."""
+    out = canvas_rgb.copy()
+    H, W, _ = out.shape
+    
+    for c in clusters:
+        x, y, w, h = c["x"], c["y"], c["w"], c["h"]
+        pad = max(6, int(min(H, W) * 0.012))
+        x0 = max(0, x - pad)
+        y0 = max(0, y - pad)
+        x1 = min(W - 1, x + w + pad)
+        y1 = min(H - 1, y + h + pad)
+        
+        # 1. Outer 1px black outline for contrast against bright scenes
+        cv2.rectangle(out, (max(0, x0 - 1), max(0, y0 - 1)), (min(W - 1, x1 + 1), min(H - 1, y1 + 1)), (0, 0, 0), 1)
+        # 2. Middle vivid color stroke
+        cv2.rectangle(out, (x0, y0), (x1, y1), box_color, thickness)
+        # 3. Inner 1px black outline for contrast against dark scenes
+        if (x1 - x0) > 4 and (y1 - y0) > 4:
+            cv2.rectangle(out, (x0 + thickness, y0 + thickness), (x1 - thickness, y1 - thickness), (0, 0, 0), 1)
+            
+        # 4. Corner reticles (viewfinder crosshair brackets)
+        reticle_len = max(6, min(16, int(min(w, h) * 0.35)))
+        cv2.line(out, (max(0, x0 - 3), y0), (x0 + reticle_len, y0), (255, 255, 255), 1)
+        cv2.line(out, (x0, max(0, y0 - 3)), (x0, y0 + reticle_len), (255, 255, 255), 1)
+        cv2.line(out, (x1 - reticle_len, y0), (min(W - 1, x1 + 3), y0), (255, 255, 255), 1)
+        cv2.line(out, (x1, max(0, y0 - 3)), (x1, y0 + reticle_len), (255, 255, 255), 1)
+        cv2.line(out, (max(0, x0 - 3), y1), (x0 + reticle_len, y1), (255, 255, 255), 1)
+        cv2.line(out, (x0, y1 - reticle_len), (x0, min(H - 1, y1 + 3)), (255, 255, 255), 1)
+        cv2.line(out, (x1 - reticle_len, y1), (min(W - 1, x1 + 3), y1), (255, 255, 255), 1)
+        cv2.line(out, (x1, y1 - reticle_len), (x1, min(H - 1, y1 + 3)), (255, 255, 255), 1)
+        
+        # 5. Region identification label pill
+        label_text = f"Region {c['id']}" if len(clusters) > 1 else "Modified Area"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.36
+        (tw, th), _ = cv2.getTextSize(label_text, font, font_scale, 1)
+        tag_y0 = max(0, y0 - th - 6)
+        tag_y1 = y0
+        tag_x0 = x0
+        tag_x1 = min(W - 1, x0 + tw + 8)
+        
+        cv2.rectangle(out, (tag_x0, tag_y0), (tag_x1, tag_y1), (20, 18, 22), -1)
+        cv2.rectangle(out, (tag_x0, tag_y0), (tag_x1, tag_y1), box_color, 1)
+        cv2.putText(out, label_text, (tag_x0 + 4, tag_y1 - 4), font, font_scale, (255, 245, 230), 1, cv2.LINE_AA)
+        
+    return out
+
+
+def generate_enhanced_diff_map(
+    rgb1: np.ndarray,
+    diff_mask: np.ndarray,
+    clusters: list,
+    lang: str = "ar"
+) -> Image.Image:
+    """Generate high-contrast amplified difference map with glowing pixels and highlight boxes."""
+    H, W, _ = rgb1.shape
+    
+    # Dark monochrome silhouette of cover image for spatial orientation
+    gray = np.mean(rgb1[:, :, :3], axis=-1, keepdims=True) * 0.15
+    vis = np.clip(gray, 10, 235).astype(np.uint8)
+    vis = np.repeat(vis, 3, axis=-1)
+    
+    if np.any(diff_mask):
+        # Visual dilation to create a luminous glowing aura around tiny 1-pixel changes
+        glow_k_size = max(3, min(7, int(min(H, W) * 0.008) * 2 + 1))
+        glow_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (glow_k_size, glow_k_size))
+        glow_mask = cv2.dilate(diff_mask.astype(np.uint8), glow_kernel, iterations=1)
+        
+        # Outer halo glow: Warm Crimson Maroon
+        vis[glow_mask > 0] = [215, 65, 95]
+        # Core modified pixels: Vivid Neon Gold / Amber
+        vis[diff_mask] = [255, 235, 75]
+        
+        # Draw high-contrast bounding boxes around detected clusters
+        vis = draw_bounding_boxes(vis, clusters, box_color=(255, 215, 65), thickness=2)
+        
+    return Image.fromarray(vis)
+
+
+def generate_zoomed_views(
+    rgb1: np.ndarray,
+    rgb2: np.ndarray,
+    diff_mask: np.ndarray,
+    cluster: Optional[dict],
+    target_dim: int = 360
+):
+    """
+    Generate enlarged, magnified crops of original, modified, and difference regions.
+    Uses Nearest-Neighbor interpolation with pixel gridlines so individual modified pixels are obvious.
+    """
+    if cluster is None or not np.any(diff_mask):
+        return None, None, None, None
+        
+    H, W, _ = rgb1.shape
+    x, y, w, h = cluster["x"], cluster["y"], cluster["w"], cluster["h"]
+    cx, cy = cluster["center"]
+    
+    # Calculate square crop window to provide surrounding context
+    crop_dim = max(w + 16, h + 16, 24)
+    crop_dim = min(crop_dim, 120, H, W)
+    half = crop_dim // 2
+    
+    x0 = max(0, min(W - crop_dim, cx - half))
+    y0 = max(0, min(H - crop_dim, cy - half))
+    x1 = min(W, x0 + crop_dim)
+    y1 = min(H, y0 + crop_dim)
+    
+    # Ensure uint8 image arrays for PIL conversion
+    u8_1 = np.asarray(rgb1, dtype=np.uint8)
+    u8_2 = np.asarray(rgb2, dtype=np.uint8)
+    crop_orig = u8_1[y0:y1, x0:x1]
+    crop_mod = u8_2[y0:y1, x0:x1]
+    
+    # Crop difference
+    local_diff = diff_mask[y0:y1, x0:x1]
+    crop_diff_base = np.zeros_like(crop_orig)
+    gray_local = np.mean(crop_orig[:, :, :3], axis=-1, keepdims=True) * 0.16
+    crop_diff_base[:, :] = np.clip(gray_local, 8, 230).astype(np.uint8)
+    
+    if np.any(local_diff):
+        local_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        local_glow = cv2.dilate(local_diff.astype(np.uint8), local_k, iterations=1)
+        crop_diff_base[local_glow > 0] = [215, 65, 95]
+        crop_diff_base[local_diff] = [255, 235, 75]
+        
+    # Nearest-Neighbor Magnification (preserves crisp square pixel blocks)
+    zoom_orig = cv2.resize(crop_orig, (target_dim, target_dim), interpolation=cv2.INTER_NEAREST)
+    zoom_mod = cv2.resize(crop_mod, (target_dim, target_dim), interpolation=cv2.INTER_NEAREST)
+    zoom_diff = cv2.resize(crop_diff_base, (target_dim, target_dim), interpolation=cv2.INTER_NEAREST)
+    
+    # Overlay subtle pixel grid if magnification factor is >= 6
+    scale_factor = target_dim / crop_dim
+    if scale_factor >= 6.0:
+        step = int(scale_factor)
+        grid_color = (35, 30, 38)
+        for i in range(step, target_dim, step):
+            cv2.line(zoom_orig, (i, 0), (i, target_dim), grid_color, 1)
+            cv2.line(zoom_orig, (0, i), (target_dim, i), grid_color, 1)
+            cv2.line(zoom_mod, (i, 0), (i, target_dim), grid_color, 1)
+            cv2.line(zoom_mod, (0, i), (target_dim, i), grid_color, 1)
+            cv2.line(zoom_diff, (i, 0), (i, target_dim), (50, 45, 55), 1)
+            cv2.line(zoom_diff, (0, i), (target_dim, i), (50, 45, 55), 1)
+            
+    info = {
+        "x_range": (x0, x1),
+        "y_range": (y0, y1),
+        "crop_size": (x1 - x0, y1 - y0),
+        "scale_factor": round(scale_factor, 1),
+        "pixel_count": cluster["pixel_count"]
+    }
+    
+    return Image.fromarray(zoom_orig), Image.fromarray(zoom_mod), Image.fromarray(zoom_diff), info
+
+
+def format_diff_legend_html(lang: str = "ar") -> str:
+    """Render a clean, bilingual visual legend for the difference map and zoom views."""
+    if lang == "ar":
+        return """
+        <div class="diff-legend-card">
+            <div class="legend-header">دليل خريطة الاختلافات والملاحظات البصرية:</div>
+            <div class="legend-items">
+                <div class="legend-item">
+                    <span class="legend-indicator box-indicator"></span>
+                    <span class="legend-title">المربع الذهبي:</span>
+                    <span class="legend-desc">إطار يحدد مكان وتجمع البكسلات المتغيرة</span>
+                </div>
+                <div class="legend-item">
+                    <span class="legend-indicator glow-indicator"></span>
+                    <span class="legend-title">البكسلات المضيئة:</span>
+                    <span class="legend-desc">بكسلات طرأ عليها تعديل فعلي في البتات</span>
+                </div>
+                <div class="legend-item">
+                    <span class="legend-indicator zoom-indicator">🔍</span>
+                    <span class="legend-title">المعاينة المكبرة:</span>
+                    <span class="legend-desc">تكبير مجهري للمنطقة لمشاهدة البكسل الواحد بوضوح</span>
+                </div>
+            </div>
+            <div class="legend-scientific-note">
+                ℹ️ <b>ملاحظة علمية:</b> التوهج والمربعات تستخدم لأغراض الإيضاح البصري فقط ولا تؤثر على الحسابات الدقيقة لعدد البكسلات ومقاييس PSNR و MSE.
+            </div>
+        </div>
+        """
+    else:
+        return """
+        <div class="diff-legend-card">
+            <div class="legend-header">Difference Map Legend & Visual Guide:</div>
+            <div class="legend-items">
+                <div class="legend-item">
+                    <span class="legend-indicator box-indicator"></span>
+                    <span class="legend-title">Highlight Box:</span>
+                    <span class="legend-desc">Region enclosing modified pixel clusters</span>
+                </div>
+                <div class="legend-item">
+                    <span class="legend-indicator glow-indicator"></span>
+                    <span class="legend-title">Bright Pixels:</span>
+                    <span class="legend-desc">Modified pixels encoding secret payload</span>
+                </div>
+                <div class="legend-item">
+                    <span class="legend-indicator zoom-indicator">🔍</span>
+                    <span class="legend-title">Enlarged Preview:</span>
+                    <span class="legend-desc">Microscopic magnification revealing individual pixels</span>
+                </div>
+            </div>
+            <div class="legend-scientific-note">
+                ℹ️ <b>Scientific Note:</b> Visual halos and highlight boxes are for visual clarity only and do not alter exact PSNR, MSE, or pixel count calculations.
+            </div>
+        </div>
+        """
+
+
+def format_zoom_header_html(lang: str = "ar") -> str:
+    """Render title and subtitle for the Zoomed Change Region panel."""
+    title = "تكبير منطقة التغيّر" if lang == "ar" else "Zoomed Change Region"
+    sub = "المربع يحدد مكان البكسلات المتغيرة • تكبير مجهري بدقة البكسل الواحد" if lang == "ar" else "Box marks the changed pixels • Microscopic single-pixel magnification"
+    return f"""
+    <div class="zoom-panel-header">
+        <div class="zoom-panel-title"><span>🔍</span> {title}</div>
+        <div class="zoom-panel-sub">{sub}</div>
+    </div>
+    """
+
+
+def format_zoom_info_html(cluster_info: Optional[dict], total_clusters: int = 1, current_idx: int = 1, lang: str = "ar") -> str:
+    """Render informative metadata card describing the magnified crop."""
+    if not cluster_info:
+        if lang == "ar":
+            return """
+            <div class="zoom-info-card zoom-info-identical">
+                ✓ <b>الصورتان متطابقتان تماماً:</b> لا توجد أي بكسلات متغيرة لتكبيرها (نسبة التشويه = 0 و PSNR = ∞ dB).
+            </div>
+            """
+        else:
+            return """
+            <div class="zoom-info-card zoom-info-identical">
+                ✓ <b>Identical Images:</b> No modified pixels detected to magnify (Distortion = 0, PSNR = ∞ dB).
+            </div>
+            """
+            
+    x0, x1 = cluster_info["x_range"]
+    y0, y1 = cluster_info["y_range"]
+    w, h = cluster_info["crop_size"]
+    scale = cluster_info["scale_factor"]
+    count = cluster_info["pixel_count"]
+    
+    if lang == "ar":
+        multi_badge = f"<span class='zoom-badge'>منطقة {current_idx} من {total_clusters}</span> " if total_clusters > 1 else ""
+        return f"""
+        <div class="zoom-info-card">
+            <div class="zoom-meta-row">
+                {multi_badge}
+                <span class="zoom-stat">📍 <b>الإحداثيات:</b> X: [{x0} .. {x1}], Y: [{y0} .. {y1}]</span>
+                <span class="zoom-stat">📐 <b>أبعاد الإطار:</b> {w} × {h} بكسل</span>
+                <span class="zoom-stat">🔍 <b>معامل التكبير:</b> {scale}× (كل بكسل = {int(scale)}×{int(scale)} نقطة)</span>
+                <span class="zoom-stat">✨ <b>البكسلات المعدلة هنا:</b> {count:,} بكسل</span>
+            </div>
+        </div>
+        """
+    else:
+        multi_badge = f"<span class='zoom-badge'>Region {current_idx} of {total_clusters}</span> " if total_clusters > 1 else ""
+        return f"""
+        <div class="zoom-info-card">
+            <div class="zoom-meta-row">
+                {multi_badge}
+                <span class="zoom-stat">📍 <b>Coordinates:</b> X: [{x0} .. {x1}], Y: [{y0} .. {y1}]</span>
+                <span class="zoom-stat">📐 <b>Frame:</b> {w} × {h} px</span>
+                <span class="zoom-stat">🔍 <b>Magnification:</b> {scale}× (each pixel = {int(scale)}×{int(scale)} dots)</span>
+                <span class="zoom-stat">✨ <b>Modified Pixels:</b> {count:,} px</span>
+            </div>
+        </div>
+        """
+
+
 def calculate_metrics(img1: Image.Image, img2: Image.Image, lang: str = "ar") -> dict:
     """Compute objective DIP metrics: PSNR, MSE, RMSE, and spatial altered pixel map."""
     rgb1 = np.array(img1.convert("RGB"), dtype=np.int16)
@@ -444,13 +773,19 @@ def calculate_metrics(img1: Image.Image, img2: Image.Image, lang: str = "ar") ->
     changed_pct = (changed_count / total_pixels) * 100.0 if total_pixels > 0 else 0.0
     max_delta = int(np.max(np.abs(diff))) if changed_count > 0 else 0
 
-    # Spatial difference map: Dark silhouette with Maroon (#8B354B -> [170, 60, 85]) altered pixels
-    h, w, _ = rgb1.shape
-    vis = np.zeros((h, w, 3), dtype=np.uint8)
-    gray = np.mean(rgb1[:, :, :3], axis=-1, keepdims=True) * 0.18
-    vis[:, :, :] = np.clip(gray, 0, 255).astype(np.uint8)
-    vis[diff_pixels] = [180, 65, 95]  # Bright Maroon accent for clear contrast
-    diff_image = Image.fromarray(vis)
+    # Detect spatial clusters and bounding boxes of modified pixels
+    clusters = detect_change_clusters(diff_pixels)
+
+    # Generate enhanced difference map with glowing pixels & high-contrast bounding boxes
+    u8_1 = np.array(img1.convert("RGB"), dtype=np.uint8)
+    u8_2 = np.array(img2.convert("RGB"), dtype=np.uint8)
+    diff_image = generate_enhanced_diff_map(u8_1, diff_pixels, clusters, lang=lang)
+
+    # Generate zoomed views for the primary change cluster
+    if clusters:
+        z_orig, z_mod, z_diff, z_info = generate_zoomed_views(u8_1, u8_2, diff_pixels, clusters[0])
+    else:
+        z_orig, z_mod, z_diff, z_info = None, None, None, None
 
     return {
         "psnr_val": psnr_val,
@@ -464,6 +799,11 @@ def calculate_metrics(img1: Image.Image, img2: Image.Image, lang: str = "ar") ->
         "quality_assessment": quality_assessment,
         "quality_tag": quality_tag,
         "diff_image": diff_image,
+        "clusters": clusters,
+        "zoom_orig": z_orig,
+        "zoom_mod": z_mod,
+        "zoom_diff": z_diff,
+        "zoom_info": z_info,
     }
 
 
@@ -1098,11 +1438,22 @@ def check_rdh_capacity_action(image: Optional[Image.Image], lang_choice: str):
 
 
 def compare_images_workflow(img1: Optional[Image.Image], img2: Optional[Image.Image], lang_choice: str):
-    """Standalone quantitative image quality comparison."""
+    """Standalone quantitative image quality comparison with bounding boxes, dilation glow, and zoomed crops."""
     lang = "ar" if (lang_choice == "العربية" or lang_choice == "ar") else "en"
     if img1 is None or img2 is None:
         err = "⚠️ يرجى رفع الصورتين (الأصلية والمعدّلة) لبدء المقارنة." if lang == "ar" else "⚠️ Please upload both original and modified images."
-        return (f"<div class='notice-box notice-error'>{err}</div>", None, "")
+        return (
+            f"<div class='notice-box notice-error'>{err}</div>",
+            None,
+            "",
+            format_diff_legend_html(lang),
+            format_zoom_header_html(lang),
+            gr.update(choices=[], value=None),
+            None,
+            None,
+            None,
+            format_zoom_info_html(None, lang=lang),
+        )
     try:
         metrics = calculate_metrics(img1, img2, lang=lang)
         cards = format_metric_cards_html(metrics, lang=lang)
@@ -1122,9 +1473,88 @@ def compare_images_workflow(img1: Optional[Image.Image], img2: Optional[Image.Im
             </div>
         </div>
         """
-        return status_html, metrics["diff_image"], cards
+
+        clusters = metrics["clusters"]
+        if clusters:
+            if lang == "ar":
+                choices = [f"المنطقة #{c['id']} — إحداثيات ({c['x']}, {c['y']}) — [{c['pixel_count']} بكسل]" for c in clusters]
+            else:
+                choices = [f"Region #{c['id']} — Pos ({c['x']}, {c['y']}) — [{c['pixel_count']} pixels]" for c in clusters]
+            sel_val = choices[0]
+        else:
+            choices = ["✓ لا توجد بكسلات متغيرة (تطابق تام)" if lang == "ar" else "✓ Identical Images (0 changed pixels)"]
+            sel_val = choices[0]
+
+        legend_html = format_diff_legend_html(lang)
+        zoom_header_html = format_zoom_header_html(lang)
+        region_dropdown_update = gr.update(choices=choices, value=sel_val)
+        zoom_info_html = format_zoom_info_html(metrics["zoom_info"], total_clusters=len(clusters), current_idx=1, lang=lang)
+
+        return (
+            status_html,
+            metrics["diff_image"],
+            cards,
+            legend_html,
+            zoom_header_html,
+            region_dropdown_update,
+            metrics["zoom_orig"],
+            metrics["zoom_mod"],
+            metrics["zoom_diff"],
+            zoom_info_html,
+        )
     except Exception as e:
-        return f"<div class='notice-box notice-error'>❌ <b>خطأ في المقارنة:</b> {str(e)}</div>", None, ""
+        return (
+            f"<div class='notice-box notice-error'>❌ <b>خطأ في المقارنة:</b> {str(e)}</div>",
+            None,
+            "",
+            format_diff_legend_html(lang),
+            format_zoom_header_html(lang),
+            gr.update(choices=[], value=None),
+            None,
+            None,
+            None,
+            f"<div class='notice-box notice-error'>{str(e)}</div>",
+        )
+
+
+def switch_zoom_region_workflow(img1: Optional[Image.Image], img2: Optional[Image.Image], selected_choice: str, lang_choice: str):
+    """Dynamically switch between detected change clusters in the Zoom preview."""
+    lang = "ar" if (lang_choice == "العربية" or lang_choice == "ar") else "en"
+    if img1 is None or img2 is None or not selected_choice:
+        return None, None, None, format_zoom_info_html(None, lang=lang)
+
+    try:
+        rgb1 = np.array(img1.convert("RGB"), dtype=np.int16)
+        rgb2 = np.array(img2.convert("RGB"), dtype=np.int16)
+        if rgb1.shape != rgb2.shape:
+            return None, None, None, ""
+
+        diff = rgb1 - rgb2
+        diff_mask = np.any(diff != 0, axis=-1)
+        if not np.any(diff_mask):
+            return None, None, None, format_zoom_info_html(None, lang=lang)
+
+        clusters = detect_change_clusters(diff_mask, max_clusters=6)
+        if not clusters:
+            return None, None, None, format_zoom_info_html(None, lang=lang)
+
+        import re
+        m = re.search(r"#(\d+)", selected_choice)
+        target_id = int(m.group(1)) if m else 1
+
+        selected_cluster = clusters[0]
+        for c in clusters:
+            if c["id"] == target_id:
+                selected_cluster = c
+                break
+
+        u8_1 = np.array(img1.convert("RGB"), dtype=np.uint8)
+        u8_2 = np.array(img2.convert("RGB"), dtype=np.uint8)
+        z_orig, z_mod, z_diff, z_info = generate_zoomed_views(u8_1, u8_2, diff_mask, selected_cluster)
+        info_html = format_zoom_info_html(z_info, total_clusters=len(clusters), current_idx=selected_cluster["id"], lang=lang)
+        return z_orig, z_mod, z_diff, info_html
+    except Exception as e:
+        return None, None, None, f"<div class='notice-box notice-error'>{str(e)}</div>"
 
 
 def parity_analysis_workflow(img: Optional[Image.Image], lang_choice: str):
@@ -2080,6 +2510,155 @@ button.secondary:hover, button[variant="secondary"]:hover {
     border-top: 1px solid var(--border-color);
     line-height: 1.5;
 }
+
+/* Difference Map Legend & Visual Guidance */
+.diff-legend-card {
+    background: rgba(33, 28, 32, 0.9);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    padding: 12px 16px;
+    margin-top: 10px;
+}
+.legend-header {
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--color-warm-beige);
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.legend-items {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.82rem;
+    line-height: 1.4;
+}
+.legend-indicator {
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    flex-shrink: 0;
+    display: inline-block;
+}
+.box-indicator {
+    border: 2px solid #FFD166;
+    background: rgba(255, 209, 102, 0.18);
+    box-shadow: 0 0 4px rgba(0, 0, 0, 0.8);
+}
+.glow-indicator {
+    background: #FFD166;
+    border-radius: 50%;
+    box-shadow: 0 0 6px rgba(255, 59, 92, 0.95), 0 0 10px rgba(255, 209, 102, 0.85);
+}
+.zoom-indicator {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+}
+.legend-title {
+    font-weight: 700;
+    color: var(--color-soft-ivory);
+    flex-shrink: 0;
+}
+.legend-desc {
+    color: var(--text-secondary);
+}
+.legend-scientific-note {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(64, 52, 60, 0.6);
+    font-size: 0.77rem;
+    color: var(--text-muted);
+    line-height: 1.45;
+}
+
+/* Zoomed Change Region Card & Inspection Panel */
+.comparison-view-container {
+    gap: 16px;
+    margin-top: 12px;
+}
+.zoom-panel-card {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    height: 100%;
+}
+.zoom-panel-header {
+    padding-bottom: 8px;
+    border-bottom: 1px solid rgba(64, 52, 60, 0.8);
+}
+.zoom-panel-title {
+    font-size: 1.02rem;
+    font-weight: 700;
+    color: var(--color-soft-ivory);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.zoom-panel-sub {
+    font-size: 0.79rem;
+    color: var(--color-warm-beige);
+    margin-top: 3px;
+    line-height: 1.35;
+}
+.zoom-region-dropdown {
+    margin: 4px 0;
+}
+.zoom-previews-row {
+    gap: 8px;
+}
+.zoom-thumb-img {
+    border: 1px solid #40343C;
+    border-radius: 8px;
+    background: #141316;
+}
+.zoom-info-card {
+    background: rgba(43, 36, 41, 0.9);
+    border: 1px solid #572334;
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 0.8rem;
+    color: var(--color-soft-ivory);
+    margin-top: 4px;
+}
+.zoom-info-identical {
+    border-color: rgba(68, 185, 154, 0.4);
+    background: rgba(68, 185, 154, 0.08);
+    color: #44B99A;
+}
+.zoom-meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+}
+.zoom-badge {
+    background: var(--color-maroon);
+    color: #FFF;
+    font-size: 0.72rem;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 4px;
+    border: 1px solid var(--color-maroon-hover);
+}
+.zoom-stat {
+    color: var(--color-soft-ivory);
+}
+.zoom-stat b {
+    color: var(--color-warm-beige);
+}
 """
 
 
@@ -2129,6 +2708,7 @@ def switch_language_action(selected_lang):
         gr.update(value=t("btn_hide_another", lang)),
         f"#### 🔍 {t('slider_title', lang)}",
         gr.update(label=t("diff_map_label", lang)),
+        format_diff_legend_html(lang),
         gr.update(label=t("tech_metrics_title", lang)),
         # 4. Reveal Message Section
         f"### {t('stego_upload_title', lang)}",
@@ -2155,6 +2735,12 @@ def switch_language_action(selected_lang):
         gr.update(label=t("cmp_mod_label", lang)),
         gr.update(value=t("btn_compare", lang)),
         gr.update(label=t("cmp_diff_label", lang)),
+        format_diff_legend_html(lang),
+        format_zoom_header_html(lang),
+        gr.update(label=t("select_region_label", lang)),
+        gr.update(label=t("zoom_orig_label", lang)),
+        gr.update(label=t("zoom_mod_label", lang)),
+        gr.update(label=t("zoom_diff_label", lang)),
         gr.update(label=t("subtab_bit", lang)),
         f"<div class='tool-intro-banner'>🔬 {t('subtab_bit_intro', lang)}</div>",
         gr.update(label=t("bit_input_label", lang)),
@@ -2416,6 +3002,7 @@ def build_app():
                                     interactive=False,
                                     elem_classes=["image-preview-container"],
                                 )
+                                hide_diff_legend = gr.HTML(format_diff_legend_html(initial_lang))
 
                         # Collapsible Detailed Analysis
                         with gr.Accordion(t("tech_metrics_title", initial_lang), open=False) as hide_tech_accordion:
@@ -2652,17 +3239,77 @@ def build_app():
                             adv_cmp_status = gr.HTML()
                             adv_cmp_cards = gr.HTML()
 
-                            with gr.Row():
-                                adv_cmp_diff = gr.Image(
-                                    label=t("cmp_diff_label", initial_lang),
-                                    type="pil",
-                                    elem_classes=["image-preview-container"],
-                                )
+                            with gr.Row(elem_classes=["comparison-view-container"]):
+                                # Left Column: Full Difference Map & Legend
+                                with gr.Column(scale=5):
+                                    adv_cmp_diff = gr.Image(
+                                        label=t("cmp_diff_label", initial_lang),
+                                        type="pil",
+                                        elem_classes=["image-preview-container"],
+                                    )
+                                    adv_cmp_legend = gr.HTML(format_diff_legend_html(initial_lang))
+
+                                # Right Column: Zoomed Change Region
+                                with gr.Column(scale=7):
+                                    with gr.Column(elem_classes=["zoom-panel-card"]):
+                                        adv_cmp_zoom_header = gr.HTML(format_zoom_header_html(initial_lang))
+                                        adv_cmp_region_selector = gr.Dropdown(
+                                            label=t("select_region_label", initial_lang),
+                                            choices=[],
+                                            value=None,
+                                            interactive=True,
+                                            elem_classes=["zoom-region-dropdown"],
+                                        )
+                                        with gr.Row(elem_classes=["zoom-previews-row"]):
+                                            with gr.Column(scale=1):
+                                                adv_cmp_zoom_orig = gr.Image(
+                                                    label=t("zoom_orig_label", initial_lang),
+                                                    type="pil",
+                                                    interactive=False,
+                                                    elem_classes=["zoom-thumb-img"],
+                                                )
+                                            with gr.Column(scale=1):
+                                                adv_cmp_zoom_mod = gr.Image(
+                                                    label=t("zoom_mod_label", initial_lang),
+                                                    type="pil",
+                                                    interactive=False,
+                                                    elem_classes=["zoom-thumb-img"],
+                                                )
+                                            with gr.Column(scale=1):
+                                                adv_cmp_zoom_diff = gr.Image(
+                                                    label=t("zoom_diff_label", initial_lang),
+                                                    type="pil",
+                                                    interactive=False,
+                                                    elem_classes=["zoom-thumb-img"],
+                                                )
+                                        adv_cmp_zoom_info = gr.HTML()
 
                             btn_adv_compare.click(
                                 fn=compare_images_workflow,
                                 inputs=[adv_cmp_img1, adv_cmp_img2, lang_selector],
-                                outputs=[adv_cmp_status, adv_cmp_diff, adv_cmp_cards],
+                                outputs=[
+                                    adv_cmp_status,
+                                    adv_cmp_diff,
+                                    adv_cmp_cards,
+                                    adv_cmp_legend,
+                                    adv_cmp_zoom_header,
+                                    adv_cmp_region_selector,
+                                    adv_cmp_zoom_orig,
+                                    adv_cmp_zoom_mod,
+                                    adv_cmp_zoom_diff,
+                                    adv_cmp_zoom_info,
+                                ],
+                            )
+
+                            adv_cmp_region_selector.change(
+                                fn=switch_zoom_region_workflow,
+                                inputs=[adv_cmp_img1, adv_cmp_img2, adv_cmp_region_selector, lang_selector],
+                                outputs=[
+                                    adv_cmp_zoom_orig,
+                                    adv_cmp_zoom_mod,
+                                    adv_cmp_zoom_diff,
+                                    adv_cmp_zoom_info,
+                                ],
                             )
 
                         # --- Sub-Tool 2: Bit Analysis ---
@@ -2825,6 +3472,7 @@ def build_app():
                 btn_hide_another,
                 hide_slider_title,
                 hide_diff_preview,
+                hide_diff_legend,
                 hide_tech_accordion,
                 reveal_cover_title,
                 reveal_input_image,
@@ -2849,6 +3497,12 @@ def build_app():
                 adv_cmp_img2,
                 btn_adv_compare,
                 adv_cmp_diff,
+                adv_cmp_legend,
+                adv_cmp_zoom_header,
+                adv_cmp_region_selector,
+                adv_cmp_zoom_orig,
+                adv_cmp_zoom_mod,
+                adv_cmp_zoom_diff,
                 subtab_bit,
                 bit_intro_html,
                 adv_steg_input,
