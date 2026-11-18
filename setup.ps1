@@ -78,8 +78,8 @@ function Invoke-HypocriticalSaintSetup {
                     continue
                 }
 
-                $TestArgs = $CandidateArgs + @("-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')")
-                $Output = & $CandidateExe $TestArgs 2>$null
+                $TestArgs = $CandidateArgs + @("-c", "import sys; print(sys.version.split()[0])")
+                $Output = & $CandidateExe @TestArgs 2>$null
                 if ($LASTEXITCODE -eq 0 -and $Output) {
                     $vParts = $Output.Trim().Split(".")
                     $vMajor = [int]$vParts[0]
@@ -200,7 +200,7 @@ function Invoke-HypocriticalSaintSetup {
             $Args = if ($PythonCmd.Length -gt 1) { $PythonCmd[1..($PythonCmd.Length - 1)] } else { @() }
             $VenvArgs = $Args + @("-m", "venv", $VenvPath)
             
-            & $Exe $VenvArgs
+            & $Exe @VenvArgs
             if (-not (Test-Path $VenvPython)) {
                 throw "Failed to create virtual environment at $VenvPath."
             }
